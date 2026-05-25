@@ -16,6 +16,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 DAYS_BACK = int(os.getenv("DAYS_BACK", "90"))
+CUSTOMER_HISTORY_START = os.getenv("CUSTOMER_HISTORY_START", "2024-01-01")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
@@ -109,6 +110,60 @@ def upsert_in_batches(table_name, rows, conflict_column=None, batch_size=500):
         total += len(batch)
 
     return total
+
+
+def sync_customers(uid):
+    print("Syncing customers...")
+
+    domain = [
+        ["customer_rank", ">", 0]
+    ]
+
+    fields = [
+        "id",
+        "name",
+        "phone",
+        "mobile",
+        "email",
+        "street",
+        "street2",
+        "city",
+        "country_id",
+        "user_id",
+        "customer_rank",
+        "supplier_rank",
+        "active",
+        "create_date",
+        "write_date"
+    ]
+
+    rows = fetch_all(uid, "res.partner", domain, fields)
+
+    output = []
+
+    for r in rows:
+        output.append({
+            "customer_id": r.get("id"),
+            "name": r.get("name"),
+            "phone": r.get("phone"),
+            "mobile": r.get("mobile"),
+            "email": r.get("email"),
+            "street": r.get("street"),
+            "street2": r.get("street2"),
+            "city": r.get("city"),
+            "country": safe_m2o(r.get("country_id"), 1),
+            "salesperson": safe_m2o(r.get("user_id"), 1),
+            "customer_rank": r.get("customer_rank"),
+            "supplier_rank": r.get("supplier_rank"),
+            "active": r.get("active"),
+            "create_date": r.get("create_date"),
+            "write_date": r.get("write_date"),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        })
+
+    count = upsert_in_batches("raw_customers", output, conflict_column="customer_id")
+    log_sync("customers", "success", "Customers synced", count)
+    print(f"Customers synced: {count}")
 
 
 def sync_products(uid):
@@ -224,6 +279,101 @@ def sync_sales_lines(uid):
     count = upsert_in_batches("raw_sales_lines", output, conflict_column="odoo_line_id")
     log_sync("sales_lines", "success", "Sales lines synced", count)
     print(f"Sales lines synced: {count}")
+
+
+def sync_customer_product_history(uid):
+    print("Syncing customer product history...")
+
+    domain = [
+        ["order_id.date_order", ">=", CUSTOMER_HISTORY_START],
+        ["order_id.state", "in", ["sale", "done"]],
+        ["product_id", "!=", False]
+    ]
+
+    fields = [
+        "id",
+        "order_id",
+        "product_id",
+        "product_uom_qty",
+        "price_unit",
+        "discount",
+        "price_subtotal",
+        "salesman_id",
+        "state"
+    ]
+
+    rows = fetch_all(uid, "sale.order.line", domain, fields)
+
+    order_ids = list({
+        safe_m2o(r.get("order_id"), 0)
+        for r in rows
+        if safe_m2o(r.get("order_id"), 0)
+    })
+
+    order_map = {}
+
+    if order_ids:
+        orders = fetch_all(
+            uid,
+            "sale.order",
+            [["id", "in", order_ids]],
+            ["id", "name", "date_order", "partner_id", "user_id", "state"]
+        )
+
+        for o in orders:
+            order_map[o.get("id")] = o
+
+    product_ids = list({
+        safe_m2o(r.get("product_id"), 0)
+        for r in rows
+        if safe_m2o(r.get("product_id"), 0)
+    })
+
+    product_map = {}
+
+    if product_ids:
+        products = fetch_all(
+            uid,
+            "product.product",
+            [["id", "in", product_ids]],
+            ["id", "display_name", "categ_id"]
+        )
+
+        for p in products:
+            product_map[p.get("id")] = p
+
+    output = []
+
+    for r in rows:
+        order_id = safe_m2o(r.get("order_id"), 0)
+        order = order_map.get(order_id, {})
+
+        product_id = safe_m2o(r.get("product_id"), 0)
+        product = product_map.get(product_id, {})
+
+        output.append({
+            "odoo_line_id": r.get("id"),
+            "order_id": order_id,
+            "order_name": order.get("name") or safe_m2o(r.get("order_id"), 1),
+            "order_date": order.get("date_order"),
+            "customer_id": safe_m2o(order.get("partner_id"), 0),
+            "customer_name": safe_m2o(order.get("partner_id"), 1),
+            "salesperson_id": safe_m2o(order.get("user_id"), 0) or safe_m2o(r.get("salesman_id"), 0),
+            "salesperson": safe_m2o(order.get("user_id"), 1) or safe_m2o(r.get("salesman_id"), 1),
+            "product_id": product_id,
+            "product_name": product.get("display_name") or safe_m2o(r.get("product_id"), 1),
+            "product_category": safe_m2o(product.get("categ_id"), 1),
+            "qty_sold": r.get("product_uom_qty") or 0,
+            "unit_price": r.get("price_unit") or 0,
+            "discount": r.get("discount") or 0,
+            "subtotal": r.get("price_subtotal") or 0,
+            "state": order.get("state") or r.get("state"),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        })
+
+    count = upsert_in_batches("customer_product_history", output, conflict_column="odoo_line_id")
+    log_sync("customer_product_history", "success", "Customer product history synced", count)
+    print(f"Customer product history synced: {count}")
 
 
 def sync_stock_quants(uid):
@@ -369,9 +519,11 @@ def main():
         print(f"Connected to Odoo. UID: {uid}")
 
         sync_products(uid)
+        sync_customers(uid)
         sync_sales_lines(uid)
         sync_stock_quants(uid)
         sync_supplier_settings(uid)
+        sync_customer_product_history(uid)
         refresh_sku_master()
 
         print("Done ✅")
