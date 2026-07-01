@@ -183,7 +183,8 @@ def sync_products(uid):
         "standard_price",
         "list_price",
         "active",
-        "type"
+        "type",
+        "barcode"
     ]
 
     rows = fetch_all(uid, "product.product", domain, fields)
@@ -201,6 +202,7 @@ def sync_products(uid):
             "sale_price": r.get("list_price") or 0,
             "active": r.get("active", True),
             "product_type": r.get("type"),
+            "barcode": r.get("barcode"),
             "updated_at": datetime.now(timezone.utc).isoformat()
         })
 
@@ -376,6 +378,90 @@ def sync_customer_product_history(uid):
     print(f"Customer product history synced: {count}")
 
 
+def sync_current_stock_by_warehouse(uid):
+    print("Syncing current stock by warehouse...")
+
+    domain = [
+        ["location_id.usage", "=", "internal"],
+        ["product_id", "!=", False]
+    ]
+
+    fields = [
+        "product_id",
+        "location_id",
+        "quantity",
+        "reserved_quantity",
+        "company_id"
+    ]
+
+    rows = fetch_all(uid, "stock.quant", domain, fields)
+
+    # Fetch product names
+    product_ids = list(set([safe_m2o(r.get("product_id"), 0) for r in rows if safe_m2o(r.get("product_id"), 0)]))
+    product_map = {}
+    if product_ids:
+        products = fetch_all(uid, "product.product", [["id", "in", product_ids]], ["id", "display_name"])
+        for p in products:
+            product_map[p.get("id")] = p.get("display_name")
+
+    # Fetch location and company names
+    location_ids = list(set([safe_m2o(r.get("location_id"), 0) for r in rows if safe_m2o(r.get("location_id"), 0)]))
+    location_map = {}
+    if location_ids:
+        locations = fetch_all(uid, "stock.location", [["id", "in", location_ids]], ["id", "display_name", "warehouse_id"])
+        for loc in locations:
+            location_map[loc.get("id")] = {"name": loc.get("display_name"), "warehouse_id": safe_m2o(loc.get("warehouse_id"), 0)}
+
+    warehouse_ids = list(set([loc["warehouse_id"] for loc in location_map.values() if loc["warehouse_id"]]))
+    warehouse_map = {}
+    if warehouse_ids:
+        warehouses = fetch_all(uid, "stock.warehouse", [["id", "in", warehouse_ids]], ["id", "name"])
+        for wh in warehouses:
+            warehouse_map[wh.get("id")] = wh.get("name")
+
+    company_ids = list(set([safe_m2o(r.get("company_id"), 0) for r in rows if safe_m2o(r.get("company_id"), 0)]))
+    company_map = {}
+    if company_ids:
+        companies = fetch_all(uid, "res.company", [["id", "in", company_ids]], ["id", "name"])
+        for comp in companies:
+            company_map[comp.get("id")] = comp.get("name")
+
+    output = []
+
+    for r in rows:
+        product_id = safe_m2o(r.get("product_id"), 0)
+        location_id = safe_m2o(r.get("location_id"), 0)
+        company_id = safe_m2o(r.get("company_id"), 0)
+
+        quantity = r.get("quantity") or 0
+        reserved_quantity = r.get("reserved_quantity") or 0
+
+        location_info = location_map.get(location_id, {})
+        warehouse_name = warehouse_map.get(location_info.get("warehouse_id")) if location_info.get("warehouse_id") else None
+
+        output.append({
+            "product_id": product_id,
+            "product_name": product_map.get(product_id),
+            "company_id": company_id,
+            "company_name": company_map.get(company_id),
+            "location_id": location_id,
+            "location_name": location_info.get("name"),
+            "warehouse_name": warehouse_name,
+            "quantity_on_hand": quantity,
+            "reserved_quantity": reserved_quantity,
+            "available_quantity": quantity - reserved_quantity,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        })
+
+    count = upsert_in_batches(
+        "current_stock_by_warehouse",
+        output,
+        conflict_column="product_id,location_id"
+    )
+
+    log_sync("current_stock_by_warehouse", "success", "Current stock by warehouse synced", count)
+    print(f"Current stock by warehouse synced: {count}")
+
 def sync_stock_quants(uid):
     print("Syncing stock quants...")
 
@@ -409,6 +495,120 @@ def sync_stock_quants(uid):
     log_sync("stock_quants", "success", "Stock quants synced", count)
     print(f"Stock quants synced: {count}")
 
+
+def sync_product_sales_from_june1(uid):
+    print("Syncing product sales from June 1...")
+
+    from_date = "2026-06-01"
+
+    domain = [
+        ["order_id.date_order", ">=", from_date],
+        ["order_id.state", "in", ["sale", "done"]],
+        ["product_id", "!=", False]
+    ]
+
+    fields = [
+        "id",
+        "order_id",
+        "product_id",
+        "product_uom_qty",
+        "price_subtotal",
+        "salesman_id",
+        "state",
+        "company_id",
+        "warehouse_id"
+    ]
+
+    rows = fetch_all(uid, "sale.order.line", domain, fields)
+
+    order_ids = list({
+        safe_m2o(r.get("order_id"), 0)
+        for r in rows
+        if safe_m2o(r.get("order_id"), 0)
+    })
+
+    order_map = {}
+
+    if order_ids:
+        orders = fetch_all(
+            uid,
+            "sale.order",
+            [["id", "in", order_ids]],
+            ["id", "name", "date_order", "partner_id", "user_id", "state", "company_id", "warehouse_id"]
+        )
+
+        for o in orders:
+            order_map[o.get("id")] = o
+
+    product_ids = list({
+        safe_m2o(r.get("product_id"), 0)
+        for r in rows
+        if safe_m2o(r.get("product_id"), 0)
+    })
+
+    product_map = {}
+
+    if product_ids:
+        products = fetch_all(
+            uid,
+            "product.product",
+            [["id", "in", product_ids]],
+            ["id", "display_name", "categ_id"]
+        )
+
+        for p in products:
+            product_map[p.get("id")] = p
+
+    company_ids = list(set([safe_m2o(r.get("company_id"), 0) for r in rows if safe_m2o(r.get("company_id"), 0)]))
+    company_map = {}
+    if company_ids:
+        companies = fetch_all(uid, "res.company", [["id", "in", company_ids]], ["id", "name"])
+        for comp in companies:
+            company_map[comp.get("id")] = comp.get("name")
+
+    warehouse_ids = list(set([safe_m2o(r.get("warehouse_id"), 0) for r in rows if safe_m2o(r.get("warehouse_id"), 0)]))
+    warehouse_map = {}
+    if warehouse_ids:
+        warehouses = fetch_all(uid, "stock.warehouse", [["id", "in", warehouse_ids]], ["id", "name"])
+        for wh in warehouses:
+            warehouse_map[wh.get("id")] = wh.get("name")
+
+    output = []
+
+    for r in rows:
+        order_id = safe_m2o(r.get("order_id"), 0)
+        order = order_map.get(order_id, {})
+
+        product_id = safe_m2o(r.get("product_id"), 0)
+        product = product_map.get(product_id, {})
+
+        company_id = safe_m2o(order.get("company_id"), 0)
+        warehouse_id = safe_m2o(order.get("warehouse_id"), 0)
+
+        output.append({
+            "odoo_line_id": r.get("id"),
+            "order_id": order_id,
+            "order_name": order.get("name") or safe_m2o(r.get("order_id"), 1),
+            "order_date": order.get("date_order"),
+            "customer_id": safe_m2o(order.get("partner_id"), 0),
+            "customer_name": safe_m2o(order.get("partner_id"), 1),
+            "salesperson": safe_m2o(order.get("user_id"), 1) or safe_m2o(r.get("salesman_id"), 1),
+            "product_id": product_id,
+            "product_name": product.get("display_name") or safe_m2o(r.get("product_id"), 1),
+            "product_category": safe_m2o(product.get("categ_id"), 1),
+            "company_id": company_id,
+            "company_name": company_map.get(company_id),
+            "warehouse_id": warehouse_id,
+            "warehouse_name": warehouse_map.get(warehouse_id),
+            "qty_sold": r.get("product_uom_qty") or 0,
+            "subtotal": r.get("price_subtotal") or 0,
+            "state": order.get("state") or r.get("state"),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        })
+
+    count = upsert_in_batches("product_sales_from_june1", output, conflict_column="odoo_line_id")
+    log_sync("product_sales_from_june1", "success", "Product sales from June 1 synced", count)
+    print(f"Product sales from June 1 synced: {count}")
 
 def sync_supplier_settings(uid):
     print("Syncing supplier settings...")
@@ -524,6 +724,8 @@ def main():
         sync_stock_quants(uid)
         sync_supplier_settings(uid)
         sync_customer_product_history(uid)
+        sync_product_sales_from_june1(uid)
+        sync_current_stock_by_warehouse(uid)
         refresh_sku_master()
 
         print("Done ✅")
